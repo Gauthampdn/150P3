@@ -222,9 +222,10 @@ int fs_delete(const char *filename)
 
 int fs_ls(void)
 {
+	printf("FS Ls:\n");
 	for(int i=0; i<FS_FILE_MAX_COUNT; i++){
 		if(rDir[i].filename[0] != '\0'){
-			printf("%s, %d, %d\n", rDir[i].filename, rDir[i].firstDBIndex, rDir[i].fileSize);
+			printf("file: %s, size: %d, data_blk: %d\n", rDir[i].filename, rDir[i].fileSize, rDir[i].firstDBIndex);
 		}
 	}
 	return 0;
@@ -353,6 +354,10 @@ int fs_write(int fd, void *buf, size_t count)
 	int RDIndex = fdTable[fd].placeInRD;
 	size_t offset = fdTable[fd].offset;
 	size_t startingDBInd = rDir[RDIndex].firstDBIndex;
+
+	printf("fd: %d, offset: %ld, file: %s\n", fd, offset, rDir[RDIndex].filename);
+
+	printf("firstDBIndex: %ld\n", startingDBInd);
 
 	size_t relativeOffset;
 	size_t currBlock = findCurrBlock(offset, startingDBInd, &relativeOffset);
