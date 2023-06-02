@@ -1,0 +1,9 @@
+MOUNT
+CREATE	file_fs
+OPEN	file_fs
+WRITE	FILE	testfile2
+SEEK	0
+READ	11383	FILE	testfile2
+CLOSE
+DELETE	file_fs
+UMOUNT
