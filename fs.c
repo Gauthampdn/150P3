@@ -58,15 +58,19 @@ int FreeFATs(void){
 }
 
 uint16_t allocateNextFAT(uint16_t curr_DB){
-	uint16_t i=-1;
+	uint16_t i = -1;
 	do{
 		i++;
 	}
 	while(i < supB.numDblocks && FAT[i] != 0);
+	//printf("after while\n");
 
 	if(i < supB.numDblocks){
+		//printf("curr_BB = %d\n", curr_DB);
 		FAT[curr_DB] = i;
+		//printf("hehdh\n");
 		FAT[i] = FAT_EOC;
+		//printf("before return\n");
 		return i;
 	}
 	return FAT_EOC;
@@ -196,7 +200,7 @@ int fs_create(const char *filename)
 			if(freeRDentry == -1){
 				freeRDentry = i;
 			}
-		} else if(strcmp((char *)rDir[freeRDentry].filename, filename) == 0) { // if file already exists
+		} else if(strcmp((char *)rDir[i].filename, filename) == 0) { // if file already exists
 			return -1;
 		} 
 	}
@@ -216,7 +220,33 @@ int fs_create(const char *filename)
 
 int fs_delete(const char *filename)
 {
-	printf("%s\n", filename);
+	if(!mounted || !IsFilenameValid(filename)){
+		return -1;
+	}
+
+	int freeRDentry = -1;
+	for(int i=0; i<FS_FILE_MAX_COUNT; i++){ 
+		if(strcmp((char *)rDir[i].filename, filename) == 0) { 
+			freeRDentry = i;
+		} 
+	}
+	if(freeRDentry == -1) {
+		return -1;
+	}
+
+	printf("1\n");
+
+	uint16_t index = rDir[freeRDentry].firstDBIndex;
+	uint16_t next_index = FAT[index];
+	while(next_index != FAT_EOC){
+		next_index = FAT[index];
+		FAT[index] = 0;
+	}
+	printf("2\n");
+	FAT[next_index] = 0;
+
+	rDir[freeRDentry].filename[0] = '\0';
+
 	return 0;
 }
 
@@ -327,19 +357,19 @@ uint16_t findCurrBlock(size_t offset, uint16_t block, size_t *relativeOffset){
 }
 
 
-
-
 int dataBlockWrite(int blockIndex, int startOffset, int byteCount, void* buf) {
 	if(byteCount == 0){
 		return 0;
 	}
 	uint8_t bounce_buf[BLOCK_SIZE];
 	block_read(blockIndex+supB.dataBStartIndex, bounce_buf);
+	//printf("after block read\n");
 
 	memcpy(&bounce_buf[startOffset], buf, byteCount);
 	if(-1 == block_write(blockIndex+supB.dataBStartIndex, bounce_buf)){
 		return -1;
 	}
+	//printf("after memcpy\n");
 	
 	return byteCount;
 }
@@ -355,22 +385,34 @@ int fs_write(int fd, void *buf, size_t count)
 	size_t offset = fdTable[fd].offset;
 	size_t startingDBInd = rDir[RDIndex].firstDBIndex;
 
-	printf("fd: %d, offset: %ld, file: %s\n", fd, offset, rDir[RDIndex].filename);
 
-	printf("firstDBIndex: %ld\n", startingDBInd);
+	if(startingDBInd == FAT_EOC){
+		uint16_t i = -1;
+		do{
+			i++;
+		}
+		while(i < supB.numDblocks && FAT[i] != 0);
+
+		if(i < supB.numDblocks){
+			rDir[RDIndex].firstDBIndex = i;
+			startingDBInd = i;
+			FAT[i] = FAT_EOC;
+		}
+	}
+
+	//printf("fd: %d, offset: %ld, file: %s\n", fd, offset, rDir[RDIndex].filename);
+
+	//printf("firstDBIndex: %ld\n", startingDBInd);
 
 	size_t relativeOffset;
 	size_t currBlock = findCurrBlock(offset, startingDBInd, &relativeOffset);
 
 	int buf_index = 0;
 
-	int byteCount;
-
+	int byteCount = count;
 	if(count > BLOCK_SIZE - relativeOffset){
 		byteCount = BLOCK_SIZE - relativeOffset;
-	} else {
-		byteCount = count;
-	}
+	} 
 
 	int BytesWritten = dataBlockWrite(currBlock, relativeOffset, byteCount, buf);
 	if(BytesWritten == -1){
@@ -403,6 +445,10 @@ int fs_write(int fd, void *buf, size_t count)
 	}
 
 	fdTable[fd].offset += buf_index + BytesWritten;
+
+	rDir[fdTable[fd].placeInRD].fileSize += buf_index + BytesWritten;
+	block_write(supB.rootDirBlockIndex, rDir);
+
 	return buf_index + BytesWritten;
 }
 
