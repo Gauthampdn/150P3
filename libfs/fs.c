@@ -9,11 +9,11 @@
 #include "disk.h"
 #include "fs.h"
 
-/* TODO: Phase 1 */
-
 #define RDENTRYSIZE 32
+#define FAT_EOC 0xFFFF
 
-struct SuperBlock {
+
+struct __attribute__((packed)) SuperBlock {
 	uint64_t signature;
 	uint16_t totBlocks;
 	uint16_t rootDirBlockIndex;
@@ -23,77 +23,59 @@ struct SuperBlock {
 	uint8_t padding[BLOCK_SIZE-17];
 };
 
-
-
-struct __attribute__((packed)) FAT{
-	uint16_t FATentry[BLOCK_SIZE/2];
-	// since 16 bits per entry (2 bytes)
-	// since each block is 4096 bytes, there has to be 4096/2 entries
-};
-
-
-
 struct __attribute__((packed)) RDentry {
-	uint8_t filename[16];
+	uint8_t filename[FS_FILENAME_LEN];
 	uint32_t fileSize;
 	uint16_t firstDBIndex;
 	uint8_t padding[RDENTRYSIZE-22];
 };
 
-struct __attribute__((packed)) rootDir{
-	struct RDentry RDlist[FS_FILE_MAX_COUNT];
-};
-
-
 struct __attribute__((packed)) fileDesc{
-	size_t location;
 	size_t offset;
-	uint8_t filename[16];
+	int placeInRD;
 };
 
 
-struct __attribute__((packed)) FDtable{
-	struct fileDesc FDlist[32];
-};
+struct SuperBlock supB;
+struct RDentry rDir[FS_FILE_MAX_COUNT];
+struct fileDesc fdTable[FS_OPEN_MAX_COUNT];
+
+uint16_t *FAT;	// since 16 bits per entry (2 bytes)
+
+bool mounted = false;
 
 
-struct SuperBlock *supB;
-struct FAT *fat;
-struct rootDir *rDir;
-struct FDtable *fdTable;
-
-//GLOBAL VALUES
-
-long unsigned int ECSHEX = 0x539B2F7DBE23A8E5;
-int numMaxFATentries = BLOCK_SIZE/2; 
-unsigned short int FAT_EOC = 0xFFFF;
-
-//------------
 
 
 int FreeFATs(void){
 	int total = 0;
-
-	for(int i = 0; i < supB->numFATBs-1; i++){ 
-		for(int j = 0; j < numMaxFATentries; j++){
-			if(fat[i].FATentry[j] == 0)
-				total++;
+	for(int i=0; i < supB.numDblocks; i++){
+		if(FAT[i] == 0){
+			total++;
 		}
 	}
-
-	for(int j = 0; j < (supB->numDblocks-(numMaxFATentries*(supB->numFATBs-1))); j++){
-		if(fat[supB->numFATBs-1].FATentry[j] == 0)
-				total++;
-	}
-
 	return total;
 }
 
+uint16_t allocateNextFAT(uint16_t curr_DB){
+	uint16_t i = -1;
+	do{
+		i++;
+	}
+	while(i < supB.numDblocks && FAT[i] != 0);
+
+	if(i < supB.numDblocks){
+		FAT[curr_DB] = i;
+		FAT[i] = FAT_EOC;
+		return i;
+	}
+	return FAT_EOC;
+}
 
 int emptyRootNum(void){
 	int total = 0;
 	for(int i = 0; i < FS_FILE_MAX_COUNT; i++){
-		if(rDir->RDlist[i].filename[0] == '\0')
+		if(rDir[i].filename[0] == '\0')
 			total++;
 	}
 	return total;
@@ -101,82 +83,100 @@ int emptyRootNum(void){
 
 
 
+bool IsFilenameValid(const char *filename){
+	int fnamelen = strlen(filename);
+	return filename != NULL && fnamelen + 1 <= FS_FILENAME_LEN && filename[fnamelen] == '\0';
+}
 
-int fs_mount(const char *diskname)
-{
+bool IsvalidSignature(){
+	char buf[9];
+	memcpy(buf, &supB.signature, 8);
+	buf[8] = '\0';
+	return strcmp(buf, "ECS150FS") == 0;
+}
+
+int fs_mount(const char *diskname) {
 	if(block_disk_open(diskname) != 0){
 		return -1;
 	}
-	supB = malloc(sizeof(struct SuperBlock));
-	if(supB==NULL){
-		fprintf(stderr,"error with malloc SuperBlock\n");
+ 
+	bool supBvalid = block_read(0, &supB) == 0 && 
+	 				 IsvalidSignature() && 
+	 				 supB.totBlocks == block_disk_count();
+	 				 // need more checks  
+
+	if(!supBvalid){
+		block_disk_close();
+		fprintf(stderr,"Failure reading superblock\n");
 		return -1;	
 	}
-	block_read(0,supB);
 
-	if(supB->signature == ECSHEX){
-		fprintf(stderr,"signature is not ECS150FS\n");
-		return -1;
-	}
-	if(supB->totBlocks!=block_disk_count()){
-		fprintf(stderr,"total blocks don't match\n");
-		return -1;
-	}
-
-	fat = malloc(supB->numFATBs * sizeof(struct FAT));  // making an array of FATS (1 to 4)
-	if(fat==NULL){
+	FAT = (uint16_t *)malloc(supB.numFATBs * BLOCK_SIZE);  // making an array of FATS 
+	
+	if(FAT == NULL){
+		block_disk_close();
 		fprintf(stderr,"error with malloc fat\n");
 		return -1;
 	}
 
-	rDir = malloc(sizeof(struct rootDir));  // making the root dir
-	if(rDir==NULL){
-		fprintf(stderr,"error with malloc rDir\n");
+	bool fatCopySuccess = true;
+	for(int i = 0; i < supB.numFATBs ; i++){  // copying each FAT block to the proper FAT number
+		if (-1 == block_read(i+1, &FAT[i*BLOCK_SIZE/2])) {
+			fatCopySuccess = false;
+		}
+	}
+	if (!fatCopySuccess){
+		free(FAT);
+		block_disk_close();
+		fprintf(stderr,"error with reading fat\n");
+		return -1;
+	}
+	
+	if(-1 == block_read(supB.rootDirBlockIndex, rDir)){  // copying over the root block dir
+		free(FAT);
+		block_disk_close();
+		fprintf(stderr,"error with reading root directory\n");
 		return -1;
 	}
 
-	for(int i = 1; i <= supB->numFATBs ; i++){  // copying each FAT block to the proper FAT number
-		block_read(i,&fat[i-1]);
+	for(int i=0; i<FS_OPEN_MAX_COUNT; i++){
+		fdTable[i].placeInRD = -1;
 	}
-
-	block_read(supB->rootDirBlockIndex,rDir);  // copying over the root block dir
 	
-	
-	
-	fdTable = malloc(sizeof(struct FDtable)); // making the FD table
-	
-	if(fdTable==NULL){
-		fprintf(stderr,"error with malloc fdTable\n");
-		return -1;
-	}
+	mounted = true;
 	return 0;
 }
 
 
 
 int fs_umount(void)
-{
+{	
+	mounted = false;
+
+	for(int i = 0; i < supB.numFATBs ; i++){ 
+		block_write(i+1, &FAT[i*BLOCK_SIZE/2]);
+	}
+	free(FAT);
+
+	block_write(supB.rootDirBlockIndex, rDir);
+
 	if( block_disk_close() != 0 ){
 		return -1;
 	}
-
-	free(supB);
-	free(fat);
-	free(rDir);
-	free(fdTable);
-
+	
 	return 0;
 }
+
 
 int fs_info(void)
 {
 	printf("FS Info:\n");
-	printf("total_blk_count=%d\n", supB->totBlocks);
-	printf("fat_blk_count=%d\n", supB->numFATBs);
-	printf("rdir_blk=%d\n", supB->rootDirBlockIndex);
-	printf("data_blk=%d\n", supB->dataBStartIndex);
-	printf("data_blk_count=%d\n", supB->numDblocks);
-	printf("fat_free_ratio=%d/%d\n",FreeFATs(), supB->numDblocks);
+	printf("total_blk_count=%d\n", supB.totBlocks);
+	printf("fat_blk_count=%d\n", supB.numFATBs);
+	printf("rdir_blk=%d\n", supB.rootDirBlockIndex);
+	printf("data_blk=%d\n", supB.dataBStartIndex);
+	printf("data_blk_count=%d\n", supB.numDblocks);
+	printf("fat_free_ratio=%d/%d\n",FreeFATs(), supB.numDblocks);
 	printf("rdir_free_ratio=%d/%d\n",emptyRootNum(), BLOCK_SIZE/32);
 	return 0;
 }
@@ -185,86 +185,362 @@ int fs_info(void)
 
 int fs_create(const char *filename)
 {
-    if (supB == NULL ){
-        return -1;
-	}
-	int fnamelen = strlen(filename);
-    int fileCount = emptyRootNum();
-
-
-	if (fnamelen + 1 > FS_FILENAME_LEN || filename[fnamelen] != '\0' || fileCount <= 0)
-	{
-	    return -1;
+	if(!mounted || !IsFilenameValid(filename)){
+		return -1;
 	}
 
+	int freeRDentry = -1;
 
-	int freeRDentry = 0;
-
-	while(freeRDentry < 128){ 
-		if (strcmp((char *)rDir->RDlist[freeRDentry].filename, filename) == 0) // if file already exists
-		{
+	for(int i=0; i<FS_FILE_MAX_COUNT; i++){ 
+		if(rDir[i].filename[0] == '\0'){
+			if(freeRDentry == -1){
+				freeRDentry = i;
+			}
+		} else if(strcmp((char *)rDir[i].filename, filename) == 0) { // if file already exists
 			return -1;
-		}
-		if(rDir->RDlist[freeRDentry].filename[0] == '\0') // if found a null character filename
-		{
-			strncpy((char *)rDir->RDlist[freeRDentry].filename, filename, strlen(filename)+1);
-			rDir->RDlist[freeRDentry].fileSize = 0;
-			rDir->RDlist[freeRDentry].firstDBIndex = FAT_EOC;
-			block_write(supB->rootDirBlockIndex, rDir);
-			return 0;
-		}
-		freeRDentry++;
+		} 
 	}
-    return -1;  // File creation failed
-}
 
+	if(freeRDentry == -1) {
+		return -1;
+	}
+
+	strncpy((char *)rDir[freeRDentry].filename, filename, strlen(filename)+1);
+	rDir[freeRDentry].fileSize = 0;
+	rDir[freeRDentry].firstDBIndex = FAT_EOC;
+	block_write(supB.rootDirBlockIndex, rDir);
+	return 0;
+}
 
 
 
 int fs_delete(const char *filename)
 {
-	printf("Deleting file: %s\n", filename);
+	if(!mounted || !IsFilenameValid(filename)){
+		return -1;
+	}
+
+	int RDindex = 0;
+	while(RDindex < FS_FILE_MAX_COUNT && strcmp((char *)rDir[RDindex].filename, filename) != 0){
+		++RDindex;
+	}
+	if(RDindex >= FS_FILE_MAX_COUNT){
+		return -1;
+	}
+
+	for(int i=0; i<FS_OPEN_MAX_COUNT; i++){
+		if(fdTable[i].placeInRD == RDindex){
+			return -1;
+		}
+	}
+
+	if(rDir[RDindex].firstDBIndex != FAT_EOC){
+		uint16_t index = rDir[RDindex].firstDBIndex + supB.dataBStartIndex;
+		uint16_t next_index = FAT[index];
+		while(next_index != FAT_EOC){
+			FAT[index] = 0;
+			index = next_index;
+			next_index = FAT[index];
+		}
+		FAT[index] = 0;
+	}
+
+	rDir[RDindex].filename[0] = '\0';
+	block_write(supB.rootDirBlockIndex, rDir);
+
 	return 0;
 }
 
 int fs_ls(void)
 {
-	printf("Listing files\n");
+	printf("FS Ls:\n");
+	for(int i=0; i<FS_FILE_MAX_COUNT; i++){
+		if(rDir[i].filename[0] != '\0'){
+			printf("file: %s, size: %d, data_blk: %d\n", rDir[i].filename, rDir[i].fileSize, rDir[i].firstDBIndex);
+		}
+	}
 	return 0;
 }
+
+
 
 int fs_open(const char *filename)
 {
-	printf("Opening file: %s\n", filename);
-	return 0;
+	if(!mounted || !IsFilenameValid(filename)){
+		return -1;
+	}
+
+	// Find the first open FD in table
+	int fd = 0;
+	while(fd<FS_OPEN_MAX_COUNT && fdTable[fd].placeInRD >= 0){
+		++fd;
+	}
+	if( fd >= FS_OPEN_MAX_COUNT) {	// there are already FS_OPEN_MAX_COUNT files currently open
+		return -1;
+	}
+	//printf("fd : %d\n", fd);
+
+	// Looking for filename in root directory
+	int rDirIndex = 0;
+	while(rDirIndex<FS_FILE_MAX_COUNT && strcmp((char *)rDir[rDirIndex].filename, filename) != 0){
+		++rDirIndex;
+	}
+
+	if(rDirIndex >= FS_FILE_MAX_COUNT){	// File not found in root directory
+		//printf("not found\n");
+		return -1;
+	}
+
+	// Store the file descriptor
+    fdTable[fd].offset = 0;
+	fdTable[fd].placeInRD = rDirIndex;
+    return fd;	// return the file descriptor (index in array)
 }
+
+
+bool isFDValid(int fd) {
+	return fd >= 0 && fd < FS_OPEN_MAX_COUNT && fdTable[fd].placeInRD >= 0;
+}
+
 
 int fs_close(int fd)
 {
-	printf("Closing file descriptor: %d\n", fd);
+	if(!mounted || !isFDValid(fd)){
+		return -1;
+	}
+	fdTable[fd].placeInRD = -1;
 	return 0;
 }
+
 
 int fs_stat(int fd)
 {
-	printf("Getting stats for file descriptor: %d\n", fd);
-	return 0;
+	if(!mounted || !isFDValid(fd)){
+		return -1;
+	}
+	int index = fdTable[fd].placeInRD;
+	return rDir[index].fileSize;
 }
+
 
 int fs_lseek(int fd, size_t offset)
 {
-	printf("Seeking file descriptor: %d to offset: %zu\n", fd, offset);
+	if(!mounted || !isFDValid(fd) || offset >= rDir[fdTable[fd].placeInRD].fileSize) {
+		return -1;
+	}
+	fdTable[fd].offset = offset;
 	return 0;
 }
+
+
+
+
+
+
+uint16_t getNextBlock(uint16_t currBlock){
+	uint16_t next = FAT[currBlock];
+	if(next == FAT_EOC){
+		next = allocateNextFAT(currBlock);
+	}
+	return next;
+}
+
+
+uint16_t findCurrBlock(size_t offset, uint16_t block, size_t *relativeOffset){
+	//printf("offset: %ld, block: %d\n", *relativeOffset, block)
+	*relativeOffset = offset;
+	uint16_t curr_block = block;
+	while(*relativeOffset >= BLOCK_SIZE){
+		*relativeOffset -= BLOCK_SIZE;
+		curr_block = getNextBlock(curr_block);
+	}
+	return curr_block;
+}
+
+
+int dataBlockWrite(int blockIndex, int startOffset, int byteCount, void* buf) {
+	if(byteCount == 0){
+		return 0;
+	}
+	uint8_t bounce_buf[BLOCK_SIZE];
+	block_read(blockIndex+supB.dataBStartIndex, bounce_buf);
+	//printf("after block read\n");
+
+	memcpy(&bounce_buf[startOffset], buf, byteCount);
+	if(-1 == block_write(blockIndex+supB.dataBStartIndex, bounce_buf)){
+		return -1;
+	}
+	//printf("after memcpy\n");
+	
+	return byteCount;
+}
+
 
 int fs_write(int fd, void *buf, size_t count)
 {
-	printf("Writing to file descriptor: %d, buffer: %p, count: %zu\n", fd, buf, count);
-	return 0;
+	if(!mounted || !isFDValid(fd)){
+		return -1;
+	} else if(count == 0){
+		return 0;
+	}
+
+	int RDIndex = fdTable[fd].placeInRD;
+	size_t offset = fdTable[fd].offset;
+	size_t startingDBInd = rDir[RDIndex].firstDBIndex;
+
+	if(startingDBInd == FAT_EOC){
+		uint16_t i = -1;
+		do{
+			i++;
+		}
+		while(i < supB.numDblocks && FAT[i] != 0);
+
+		if(i < supB.numDblocks){
+			rDir[RDIndex].firstDBIndex = i;
+			startingDBInd = i;
+			FAT[i] = FAT_EOC;
+		} else {
+			return 0;
+		}
+	}
+
+	//printf("fd: %d, offset: %ld, file: %s\n", fd, offset, rDir[RDIndex].filename);
+
+	//printf("firstDBIndex: %ld\n", startingDBInd);
+
+	size_t relativeOffset;
+	size_t currBlock = findCurrBlock(offset, startingDBInd, &relativeOffset);
+
+	int buf_index = 0;
+
+	int byteCount = count;
+	if(count > BLOCK_SIZE - relativeOffset){
+		byteCount = BLOCK_SIZE - relativeOffset;
+	} 
+
+	int BytesWritten = dataBlockWrite(currBlock, relativeOffset, byteCount, buf);
+	if(BytesWritten == -1){
+		return -1; //need to change 
+	}
+	buf_index += BytesWritten;
+	currBlock = getNextBlock(currBlock);
+	if(currBlock == FAT_EOC){
+		fdTable[fd].offset += buf_index + BytesWritten;
+		return buf_index;
+	}
+
+	// middle full blocks
+	while(count - buf_index >= BLOCK_SIZE){
+		BytesWritten = dataBlockWrite(currBlock, 0, BLOCK_SIZE, &((uint8_t*)buf)[buf_index]);
+		if(BytesWritten == -1){
+			return -1; //need to change 
+		}
+		buf_index += BytesWritten; 
+		currBlock = getNextBlock(currBlock);
+		if(currBlock == FAT_EOC){
+			fdTable[fd].offset += buf_index + BytesWritten;
+			return buf_index;
+		}
+	}
+
+	BytesWritten = dataBlockWrite(currBlock, 0, count - buf_index, &((uint8_t*)buf)[buf_index]);
+	if(BytesWritten == -1){
+		return -1; //need to change 
+	}
+
+	fdTable[fd].offset += buf_index + BytesWritten;
+
+	rDir[fdTable[fd].placeInRD].fileSize += buf_index + BytesWritten;
+	block_write(supB.rootDirBlockIndex, rDir);
+
+	return buf_index + BytesWritten;
 }
+
+
+
+
+int dataBlockRead(int blockIndex, int startOffset, int byteCount, void* buf) {
+	uint8_t bounce_buf[BLOCK_SIZE];
+	if(byteCount == 0){
+		return 0;
+	}
+	if(-1 == block_read(blockIndex+supB.dataBStartIndex, bounce_buf)){
+		return -1;
+	}
+	memcpy(buf, &bounce_buf[startOffset], byteCount);
+	return byteCount;
+}
+
 
 int fs_read(int fd, void *buf, size_t count)
 {
-	printf("Reading from file descriptor: %d, buffer: %p, count: %zu\n", fd, buf, count);
-	return 0;
+    if(!mounted || !isFDValid(fd)){
+		return -1;
+	}
+
+	int RDIndex = fdTable[fd].placeInRD;
+	size_t offset = fdTable[fd].offset;
+	size_t startingDBInd = rDir[RDIndex].firstDBIndex;
+	//printf("startingDBInd: %ld\n", startingDBInd);
+
+	size_t relativeOffset;
+	size_t currBlock = findCurrBlock(offset, startingDBInd, &relativeOffset);
+
+	int buf_index = 0;
+
+	// BytesToRead = minimum of count and whats left of file 
+	size_t BytesLeftOfFile = rDir[RDIndex].fileSize - offset;
+	size_t BytesToRead = count;
+	if(BytesLeftOfFile < count){
+		BytesToRead = BytesLeftOfFile;
+	}
+
+	int BytesCopied = 0;
+	int BytesToReadInBlock;
+
+	// first block
+	if(BytesToRead > BLOCK_SIZE - relativeOffset){
+		BytesToReadInBlock = BLOCK_SIZE - relativeOffset;
+	} else {
+		BytesToReadInBlock = BytesToRead;
+	}
+	
+	//printf("1 block: %ld, offset: %ld, BytesToReadInBlock: %d, BytesToRead: %ld\n", currBlock, relativeOffset, BytesToReadInBlock, BytesToRead);
+
+	BytesCopied = dataBlockRead(currBlock, relativeOffset, BytesToReadInBlock, buf);
+
+	//printf("2 block: %ld, offset: %ld, BytesCopied: %d, BytesToRead: %ld\n", currBlock, relativeOffset, BytesCopied, BytesToRead);
+
+	if(BytesCopied == -1){
+		return -1; //need to change 
+	}
+	BytesToRead -= BytesCopied;
+	buf_index += BytesCopied; 
+	currBlock = getNextBlock(currBlock);
+
+	//printf("block: %ld, offset: %ld, BytesToReadInBlock: %d\n", currBlock, relativeOffset, BytesToReadInBlock);
+	//printf("<%s>\n", (char *)buf);
+	//printf("bytes copied: %d\n", BytesCopied);
+
+	// middle full blocks
+	while(BytesToRead >= BLOCK_SIZE){
+		BytesCopied = dataBlockRead(currBlock, 0, BLOCK_SIZE, &((uint8_t*)buf)[buf_index]);
+		//printf("3 block: %ld, offset: %ld, BytesCopied: %d, BytesToRead: %ld\n", currBlock, relativeOffset, BytesCopied, BytesToRead);
+		if(BytesCopied == -1){
+			return -1; //need to change 
+		}
+		BytesToRead -= BytesCopied;
+		buf_index += BytesCopied; 
+		currBlock = getNextBlock(currBlock);
+	}
+
+	// last block
+	BytesCopied = dataBlockRead(currBlock, 0, BytesToRead, &((uint8_t*)buf)[buf_index]);
+	//printf("4 block: %ld, offset: %ld, BytesCopied: %d, BytesToRead: %ld\n", currBlock, relativeOffset, BytesCopied, BytesToRead);
+	if(BytesCopied == -1){
+		return -1; //need to change 
+	}
+
+	fdTable[fd].offset +=  buf_index + BytesCopied;
+	return buf_index + BytesCopied;
 }
