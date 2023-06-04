@@ -123,7 +123,7 @@ int fs_mount(const char *diskname) {
 		block_disk_close();
 		return -1;
 	}
-	
+		
 	if(-1 == block_read(supB.rootDirBlockIndex, rDir)){  // copying over the root block dir
 		free(FAT);
 		block_disk_close();
@@ -251,6 +251,9 @@ int fs_delete(const char *filename)
 
 int fs_ls(void)
 {
+	if(!mounted){
+		return -1;
+	}
 	printf("FS Ls:\n");
 	for(int i=0; i<FS_FILE_MAX_COUNT; i++){
 		if(rDir[i].filename[0] != '\0'){
@@ -285,7 +288,6 @@ int fs_open(const char *filename)
 	}
 
 	if(rDirIndex >= FS_FILE_MAX_COUNT){	// File not found in root directory
-		//printf("not found\n");
 		return -1;
 	}
 
@@ -440,7 +442,10 @@ int fs_write(int fd, void *buf, size_t count)
 
 	fdTable[fd].offset += buf_index + BytesWritten;
 
-	rDir[fdTable[fd].placeInRD].fileSize += buf_index + BytesWritten;
+	if(fdTable[fd].offset > rDir[fdTable[fd].placeInRD].fileSize){
+		rDir[fdTable[fd].placeInRD].fileSize = fdTable[fd].offset;
+	}
+
 	block_write(supB.rootDirBlockIndex, rDir);
 
 	return buf_index + BytesWritten;
